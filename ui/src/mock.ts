@@ -245,6 +245,15 @@ export function installMock(): void {
     openHomeFixAuthor: async () => {},
     setUiLanguage: async () => {},
     openPenguLoader: async () => {},
+getRemoteStatus: async () => ({
+  running: true,
+  url: "http://192.168.1.50:3000/?pin=123456",
+  pin: "123456",
+  qrSvg: `<svg width="180" height="180" viewBox="0 0 180 180" xmlns="http://www.w3.org/2000/svg"><rect width="180" height="180" fill="#0a1428"/><rect x="20" y="20" width="45" height="45" fill="none" stroke="#c8aa6e" stroke-width="6"/><rect x="34" y="34" width="17" height="17" fill="#c8aa6e"/><rect x="115" y="20" width="45" height="45" fill="none" stroke="#c8aa6e" stroke-width="6"/><rect x="129" y="34" width="17" height="17" fill="#c8aa6e"/><rect x="20" y="115" width="45" height="45" fill="none" stroke="#c8aa6e" stroke-width="6"/><rect x="34" y="129" width="17" height="17" fill="#c8aa6e"/></svg>`,
+  connectedClients: 1,
+  lcuConnected: true,
+  phase: "Lobby",
+}),
   } satisfies typeof api);
   Object.assign(events, {
     onLoginStep: async (handler: Handler<LoginStep>) => (listeners.step.push(handler), unlisten()),
