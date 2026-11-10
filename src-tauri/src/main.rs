@@ -7,6 +7,7 @@
 
 mod login_control;
 mod refresh;
+mod remote;
 mod scale;
 mod updater;
 mod views;
@@ -1001,6 +1002,7 @@ fn main() {
             open_logs_folder,
             open_home_fix_author,
             open_pengu_loader,
+            remote::get_remote_status,
         ])
         .setup(move |app| {
     logging::install_panic_hook();
@@ -1059,6 +1061,10 @@ fn main() {
             }
             spawn_scheduler(app.handle().clone(), Arc::clone(&shared));
             updater::spawn(app.handle().clone(), Arc::clone(&shared));
+         let remote_state = remote::RemoteState::new(3000);
+            remote::spawn_remote_server(Arc::clone(&remote_state));
+            app.manage(remote_state);
+
             Ok(())
         })
         .build(tauri::generate_context!());

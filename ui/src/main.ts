@@ -1159,6 +1159,65 @@ function showShortcuts(): void {
     actions: [{ label: t("common.ok"), value: "ok", kind: "primary" }],
   });
 }
+async function openRemoteModal(): Promise<void> {
+  const res = await guard(() => api.getRemoteStatus(), "toast.settingsFailed");
+  if (!res.ok) return;
+  const info = res.value;
+
+  let timer: number | undefined;
+
+  await modal({
+    title: "LoL Remote — Companion Móvil",
+    body: `
+      <div style="display:flex;flex-direction:column;align-items:center;gap:14px;text-align:center;padding:6px 0">
+        <div id="remote-qr" style="background:#0a1428;padding:12px;border-radius:10px;border:1px solid rgba(200,170,110,0.4);box-shadow:0 6px 20px rgba(0,0,0,0.5)">
+          ${info.qrSvg}
+        </div>
+        <div>
+          <p class="hint" style="margin:0 0 6px">Escaneá el QR con tu celular (conectado al mismo Wi-Fi) para controlar el lobby, campeón, hechizos, skins y runas.</p>
+          <div style="font-size:15px;margin-top:6px">
+            PIN de acceso: <strong id="remote-pin" style="color:#c8aa6e;letter-spacing:2px;font-size:18px">${esc(info.pin)}</strong>
+          </div>
+          <div style="margin-top:6px;display:flex;align-items:center;justify-content:center;gap:8px">
+            <code id="remote-url" style="font-size:12px;padding:4px 8px;background:rgba(0,0,0,0.35);border-radius:4px;color:#f0e6d2">${esc(info.url)}</code>
+            <button type="button" class="btn btn-ghost" data-copy-remote style="padding:4px 10px;font-size:12px">${icon("copy", 13)} Copiar</button>
+          </div>
+        </div>
+        <div id="remote-live" style="width:100%;padding:10px 14px;border-radius:8px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);display:flex;justify-content:space-between;font-size:13px">
+          <span>📱 Celulares: <b id="remote-clients">${info.connectedClients}</b></span>
+          <span>🎮 Cliente LoL: <b id="remote-phase" style="color:${info.lcuConnected ? "#0ac8b9" : "#e0a63c"}">${esc(info.lcuConnected ? info.phase : "Cerrado")}</b></span>
+        </div>
+      </div>`,
+    actions: [{ label: t("common.ok"), value: "ok", kind: "primary" }],
+    onOpen: (root) => {
+      root.querySelector("[data-copy-remote]")?.addEventListener("click", async () => {
+        const urlText = root.querySelector("#remote-url")?.textContent ?? info.url;
+        await navigator.clipboard.writeText(urlText);
+        toast("success", "Enlace copiado", urlText);
+      });
+
+      timer = window.setInterval(async () => {
+        try {
+          const fresh = await api.getRemoteStatus();
+          const clientsEl = root.querySelector("#remote-clients");
+          const phaseEl = root.querySelector<HTMLElement>("#remote-phase");
+          if (clientsEl) clientsEl.textContent = String(fresh.connectedClients);
+          if (phaseEl) {
+            phaseEl.textContent = fresh.lcuConnected ? fresh.phase : "Cerrado";
+            phaseEl.style.color = fresh.lcuConnected ? "#0ac8b9" : "#e0a63c";
+          }
+        } catch {
+          // Ignorar si el modal se está cerrando
+        }
+      }, 2000);
+    },
+    onSubmit: async () => {
+      if (timer) clearInterval(timer);
+      return true;
+    },
+  });
+  if (timer) clearInterval(timer);
+}
 
 // ---------------------------------------------------------------- language
 
@@ -1280,6 +1339,27 @@ function wire(): void {
 
   $("#schedule").addEventListener("click", () => void refreshAll());
   $("#open-add").addEventListener("click", () => openAddDrawer());
+  // Inyecta el botón "LoL Remote" en la barra lateral junto al resto de acciones
+  const settingsBtn = document.querySelector<HTMLButtonElement>('[data-action="settings"]');
+  if (settingsBtn && !document.querySelector('[data-action="remote"]')) {
+    const remoteBtn = settingsBtn.cloneNode(true) as HTMLButtonElement;
+    remoteBtn.dataset.action = "remote";
+    remoteBtn.removeAttribute("data-i18n");
+    remoteBtn.innerHTML = `${icon("external-link")}<span>LoL Remote</span>`;
+    settingsBtn.parentElement?.insertBefore(remoteBtn, settingsBtn);
+  }
+
+  document.querySelectorAll<HTMLButtonElement>("[data-action]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const action = button.dataset.action;
+      if (action === "remote") void openRemoteModal();
+      if (action === "import") void importData();
+      if (action === "export") void exportData();
+      if (action === "logs") void guard(() => api.openLogsFolder(), "toast.logsFailed");
+      if (action === "shortcuts") showShortcuts();
+      if (action === "settings") void openSettings();
+    });
+  });
   document.querySelectorAll<HTMLButtonElement>("[data-action]").forEach((button) => {
     button.addEventListener("click", () => {
       const action = button.dataset.action;

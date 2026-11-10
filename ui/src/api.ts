@@ -263,6 +263,16 @@ async function call<T>(command: string, args?: Record<string, unknown>): Promise
   }
 }
 
+export interface RemoteStatus {
+  running: boolean;
+  url: string;
+  pin: string;
+  qrSvg: string;
+  connectedClients: number;
+  lcuConnected: boolean;
+  phase: string;
+}
+
 export const api = {
   bootstrap: () => call<Bootstrap>("bootstrap"),
   appReady: () => call<boolean>("app_ready"),
@@ -300,6 +310,7 @@ export const api = {
   openHomeFixAuthor: () => call<void>("open_home_fix_author"),
   /** Opens Pengu Loader's site; the plugin needs it installed. */
   openPenguLoader: () => call<void>("open_pengu_loader"),
+  getRemoteStatus: () => call<RemoteStatus>("get_remote_status"),
 };
 
 export const events = {
