@@ -1,4 +1,5 @@
 name: Build EXE
+
 on:
   push:
     branches: [ main ]
@@ -7,15 +8,27 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 20
-      - uses: dtolnay/rust-toolchain@stable
-      - run: npm install
-      - run: npx tauri build --no-bundle
-      - uses: actions/upload-artifact@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build Tauri App (Release)
+        run: npx tauri build
+
+      - name: Upload LeagueAccounts Artifact
+        uses: actions/upload-artifact@v4
         with:
           name: LeagueAccounts-Portable
           path: src-tauri/target/release/LeagueAccounts.exe
