@@ -30,7 +30,7 @@ jobs:
       - name: Upload LeagueAccounts Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: LeagueAccounts-Portable
+          name: LeagueAccounts-Build
           path: |
-            src-tauri/target/release/LeagueAccounts.exe
-            src-tauri/target/release/bundle/**/*.exe
+            src-tauri/target/release/**/*.exe
+            src-tauri/target/release/bundle/**/*
