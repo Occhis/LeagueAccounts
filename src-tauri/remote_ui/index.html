@@ -1,0 +1,474 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#010a13">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>LoL Remote — Companion</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header><span id="dot"></span><h1 id="phase">LoL Remote</h1></header>
+<main id="app"></main>
+<div id="toast" role="alert"></div>
+
+<script>
+const $ = (s) => document.querySelector(s)
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+const norm = (s) => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+
+let ws, init = null, S = { connected: false, phase: 'Offline' }, filter = '', recvAt = 0, opened = false
+let tab = null, rtab = 'rec', spSlot = 1
+const skinsCache = {}, skinsReq = new Set() // skins por campeón
+let lastHtml = '' // último HTML dibujado (evita reconstruir la pantalla si no cambió nada)
+let swSlot = 0, swTab = 'champ' // Swiftplay: casillero activo y pestaña
+let draft = { primary: null, sub: null, main: [], subs: [], shards: [] }
+let roleSelecting = null // 'first' o 'second' para cambiar de rol
+
+const PHASES = { Offline: 'Sin conexión', None: 'Inicio', Lobby: 'Lobby', Matchmaking: 'Buscando partida', ReadyCheck: '¡Partida encontrada!',
+  ChampSelect: 'Selección de campeón', GameStart: 'Iniciando partida', InProgress: 'En partida', Reconnect: 'Reconectar',
+  WaitingForStats: 'Fin de partida', PreEndOfGame: 'Fin de partida', EndOfGame: 'Fin de partida' }
+const CS_PHASES = { PLANNING: 'Planificación', BAN_PICK: 'Baneos y picks', FINALIZATION: 'Últimos retoques', GAME_STARTING: 'Empieza la partida' }
+
+const POSITIONS = [
+  { id: 'TOP', name: 'Top' },
+  { id: 'JUNGLE', name: 'Jungla' },
+  { id: 'MIDDLE', name: 'Mid' },
+  { id: 'BOTTOM', name: 'Bot' },
+  { id: 'UTILITY', name: 'Support' }
+]
+
+const posName = (id) => POSITIONS.find(p => p.id === id)?.name || id
+
+const q = new URLSearchParams(location.search)
+if (q.get('pin')) { localStorage.pin = q.get('pin'); history.replaceState(null, '', location.pathname) }
+
+function connect() {
+  const pin = localStorage.pin
+  if (!pin) return render()
+  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/?pin=${encodeURIComponent(pin)}`)
+  opened = false
+  ws.onopen = () => { opened = true; render() }
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data)
+    if (m.t === 'init') init = m
+    else if (m.t === 'toast') toast(m.msg, m.ok)
+    else if (m.t === 'skins') { skinsCache[m.championId] = m.list; skinsReq.delete(m.championId) }
+    else if (m.t === 'state') {
+      if (m.phase !== S.phase && ['ReadyCheck', 'ChampSelect'].includes(m.phase)) navigator.vibrate?.([250, 100, 250])
+      S = m; recvAt = Date.now()
+    }
+    render()
+  }
+  ws.onclose = () => {
+    if (!opened) delete localStorage.pin
+    else setTimeout(connect, 1500)
+    render()
+  }
+}
+const send = (o) => ws?.readyState === 1 && ws.send(JSON.stringify(o))
+function toast(msg, ok) {
+  const t = $('#toast'); t.textContent = msg; t.className = ok ? 'ok' : ''; t.style.display = 'block'
+  clearTimeout(toast.id); toast.id = setTimeout(() => (t.style.display = 'none'), 3500)
+}
+
+const icon = (id) => { const c = init?.champs[id]; return c ? `https://ddragon.leagueoflegends.com/cdn/${init.version}/img/champion/${c[0]}.png` : '' }
+const nm = (id) => init?.champs[id]?.[1] || ''
+const img = (id, cls = '') => id > 0 && init?.champs[id] ? `<img class="ch ${cls}" src="${icon(id)}" alt="${esc(nm(id))}">` : `<div class="ch empty ${cls}"></div>`
+const qName = (id) => init?.queues.find((x) => x.id === id)?.name || 'Lobby'
+const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`
+
+function gridHTML() {
+  const sw = S.phase === 'Lobby'
+  const cur = sw ? S.lobby?.slots?.[swSlot]?.champ : 0
+  const avail = !sw && S.cs?.pool?.length ? new Set(S.cs.pool.map(String)) : null
+  const pool = Object.keys(init?.champs || {})
+  const f = norm(filter)
+  return pool.filter((id) => init.champs[id] && (!avail || avail.has(id)) && norm(nm(id)).includes(f))
+    .sort((a, b) => nm(a).localeCompare(nm(b), 'es'))
+    .map((id) => `<button class="pick ${sw && +id === cur ? 'sel' : ''}" data-cmd="${sw ? 'slotChampion' : 'choose'}" ${sw ? `data-slot="${swSlot}"` : ''} data-champion-id="${id}">${img(id).replace('class="ch ', 'class="')}<span>${esc(nm(id))}</span></button>`).join('')
+}
+
+const teamHTML = (arr) => arr.map((p) => `<div class="slot ${p.me ? 'me' : ''}">${img(p.champ)}<span>${esc(nm(p.champ) || 'Vacío')}</span></div>`).join('')
+
+const cdn = (p) => p ? `https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default/${p.replace('/lol-game-data/assets/', '').toLowerCase()}` : ''
+const style = (id) => init.runes.styles.find((s) => s.id === id)
+const perkImg = (id, cls = '') => { const p = init.runes.perks[id]; return p ? `<img class="${cls}" src="${cdn(p[1])}" alt="${esc(p[0])}" title="${esc(p[0])}">` : `<span>${id}</span>` }
+const treeImg = (id, cls = '') => { const s = style(id); return s ? `<img class="${cls}" src="${cdn(s.icon)}" alt="${esc(s.name)}" title="${esc(s.name)}">` : '' }
+const spImg = (id) => { const s = init.spells?.[id]; return s ? `<img class="sp" src="https://ddragon.leagueoflegends.com/cdn/${init.version}/img/spell/${s[0]}" alt="${esc(s[1])}">` : '<div class="sp"></div>' }
+const rowOf = (styleId, perkId) => style(styleId)?.slots.findIndex((r) => r.includes(perkId)) ?? -1
+const draftPerks = () => {
+  const d = draft
+  const main = [0, 1, 2, 3].map((i) => d.main[i])
+  const subs = [...d.subs].sort((a, b) => a.row - b.row).map((x) => x.id)
+  const all = [...main, ...subs, ...[0, 1, 2].map((i) => d.shards[i])]
+  return d.primary && d.sub && subs.length === 2 && all.every(Boolean) ? all : null
+}
+
+const acts = {
+  pin: () => { const p = prompt('PIN de 6 dígitos'); if (p) { localStorage.pin = p.trim(); connect() } },
+  tab: (d) => { tab = tab === d.tab ? null : d.tab },
+  rtab: (d) => { rtab = d.rtab },
+  slot: (d) => { spSlot = Number(d.slot) },
+  primary: (d) => { draft.primary = +d.id; draft.main = []; if (draft.sub === +d.id) { draft.sub = null; draft.subs = [] } },
+  main: (d) => { draft.main[+d.row] = +d.id },
+  subtree: (d) => { draft.sub = +d.id; draft.subs = [] },
+  sub: (d) => {
+    const row = +d.row, id = +d.id
+    const same = draft.subs.some((x) => x.row === row && x.id === id)
+    draft.subs = draft.subs.filter((x) => x.row !== row)
+    if (!same) draft.subs.push({ row, id })
+    if (draft.subs.length > 2) draft.subs.shift()
+  },
+  shard: (d) => { draft.shards[+d.row] = +d.id },
+  loadrec: (d) => {
+    const r = curRecs()[+d.i]
+    if (!r) return
+    draftFromPerks(r.primary, r.sub, r.perks)
+    rtab = 'manual'
+  },
+  skinsretry: (d) => { delete skinsCache[d.championId] },
+  swslot: (d) => { swSlot = +d.slot; syncDraft() },
+  swtab: (d) => { swTab = d.swtab; if (swTab === 'runes') syncDraft() },
+  applyDraft: () => {
+    const p = draftPerks()
+    if (!p) return toast('Completá todas las runas primero')
+    if (S.phase === 'Lobby') send({ t: 'cmd', cmd: 'slotRunes', slot: swSlot, primary: draft.primary, sub: draft.sub, perks: p })
+    else send({ t: 'cmd', cmd: 'applyRunes', name: 'LoL Remote', primary: draft.primary, sub: draft.sub, perks: p })
+  },
+  toggleRoleSelector: (d) => {
+    roleSelecting = roleSelecting === d.type ? null : d.type
+  },
+  setRoleChoice: (d) => {
+    if (!S.lobby || !S.lobby.positions) return;
+    let currentFirst = S.lobby.positions.firstPreference;
+    let currentSecond = S.lobby.positions.secondPreference;
+    
+    let newFirst = currentFirst;
+    let newSecond = currentSecond;
+
+    if (d.type === 'first') {
+      newFirst = d.role;
+      if (newSecond === newFirst) {
+        newSecond = (newFirst === 'TOP' ? 'MIDDLE' : 'TOP');
+      }
+    } else {
+      newSecond = d.role;
+      if (newFirst === newSecond) {
+        newFirst = (newSecond === 'TOP' ? 'MIDDLE' : 'TOP');
+      }
+    }
+
+    // Actualización optimista inmediata en la interfaz móvil
+    S.lobby.positions.firstPreference = newFirst;
+    S.lobby.positions.secondPreference = newSecond;
+    roleSelecting = null;
+    render();
+
+    // Enviamos el comando a la PC
+    send({ t: 'cmd', cmd: 'setRole', type: d.type, role: d.role, first: newFirst, second: newSecond });
+  }
+}
+
+function spellsHTML(c) {
+  const sw = S.phase === 'Lobby'
+  const sl = sw ? S.lobby?.slots?.[swSlot] : null
+  const cur = sw ? [sl?.spell1 || 0, sl?.spell2 || 0] : [c?.me?.spell1 || 0, c?.me?.spell2 || 0]
+  if ((sw ? !sl : !c?.me) || !init.spells) return '<p class="muted" style="margin-top:10px">Todavía no hay datos de hechizos.</p>'
+  const mode = sw ? 'CLASSIC' : c.mapId === 12 ? 'ARAM' : c.gameMode
+  const has = (k, m) => (init.spells[k][2] || []).includes(m)
+  let ids = Object.keys(init.spells).filter((k) => has(k, mode))
+  if (ids.length < 4) ids = Object.keys(init.spells).filter((k) => has(k, 'CLASSIC'))
+  if (ids.length < 4) ids = Object.keys(init.spells)
+  ids.sort((a, b) => init.spells[a][1].localeCompare(init.spells[b][1], 'es'))
+  const slotBtn = (n) => `<button class="slotbtn ${spSlot === n ? 'on' : ''}" data-act="slot" data-slot="${n}">${spImg(cur[n - 1])}<span>${esc(init.spells[cur[n - 1]]?.[1] || 'Vacío')}</span></button>`
+  const attrs = sw ? `data-cmd="slotSpells" data-slot="${swSlot}"` : 'data-cmd="setSpells"'
+  const grid = ids.map((id) => {
+    const k = +id
+    let [a, b] = cur
+    if (spSlot === 1) { if (k === b) b = a; a = k } else { if (k === a) a = b; b = k }
+    if (!a) a = b === 4 ? 14 : 4
+    if (!b) b = a === 4 ? 14 : 4
+    return `<button class="pick ${cur.includes(k) ? 'sel' : ''}" ${attrs} data-spell1-id="${a}" data-spell2-id="${b}">${spImg(k)}<span>${esc(init.spells[id][1])}</span></button>`
+  }).join('')
+  return `<div class="slots" style="margin-top:10px">${slotBtn(1)}${slotBtn(2)}</div><p class="muted" style="margin:8px 0;font-size:12px">Tocá un casillero y seleccioná el hechizo deseado.</p><div class="grid spgrid">${grid}</div>`
+}
+
+// ───────── Skins (champ select y Swiftplay) ─────────
+function skinsHTML(champId, curSkin, extra = '') {
+  if (!champId || !init?.champs[champId]) return '<p class="muted" style="margin-top:10px">Elegí o marcá un campeón para ver sus skins.</p>'
+  const L = skinsCache[champId]
+  if (!L) {
+    if (!skinsReq.has(champId)) { skinsReq.add(champId); send({ t: 'cmd', cmd: 'skins', championId: champId }) }
+    return '<p class="muted" style="margin-top:10px">Cargando skins…</p>'
+  }
+  if (!L.length) return `<p class="muted" style="margin:10px 0">No pude cargar las skins de este campeón.</p><button class="btn" data-act="skinsretry" data-champion-id="${champId}">Reintentar</button>`
+  const dd = (s) => `https://ddragon.leagueoflegends.com/cdn/img/champion/tiles/${init.champs[champId][0]}_${s.num}.jpg`
+  const cards = L.map((s) => `<button class="pick ${s.id === curSkin ? 'sel' : ''}" data-cmd="setSkin" data-skin-id="${s.id}" ${extra} title="${esc(s.name)}">
+      <img src="${s.tile ? cdn(s.tile) : dd(s)}" alt="" loading="lazy" onerror="this.onerror=null;this.src='${dd(s)}'">
+      <span style="white-space:normal;line-height:1.15;font-size:10px">${esc(s.base ? 'Clásica' : s.name)}</span></button>`).join('')
+  return `<p class="muted" style="margin:10px 0 8px;font-size:12px">Tocá una skin para usarla con ${esc(nm(champId))}.</p><div class="grid spgrid" style="grid-template-columns:repeat(auto-fill,minmax(78px,1fr))">${cards}</div>`
+}
+
+// ───────── Runas (editor compartido: champ select y Swiftplay) ─────────
+const curDiag = () => (S.phase === 'Lobby' ? S.lobby?.slots?.[swSlot]?.diag : S.cs?.recDiag) || []
+const curRecs = () => (S.phase === 'Lobby' ? S.lobby?.slots?.[swSlot]?.recs : S.cs?.recs) || []
+
+function draftFromPerks(primary, sub, p) {
+  draft = { primary, sub, main: p.slice(0, 4), subs: p.slice(4, 6).map((id) => ({ row: rowOf(sub, id), id })), shards: p.slice(6, 9) }
+}
+// Al cambiar de casillero, el editor arranca con las runas que ese casillero ya tiene
+function syncDraft() {
+  const p = S.lobby?.slots?.[swSlot]?.perks
+  if (p && p.ids?.length >= 9 && style(p.primary)) draftFromPerks(p.primary, p.sub, p.ids)
+  else draft = { primary: null, sub: null, main: [], subs: [], shards: [] }
+}
+
+function runeEditorHTML() {
+  const R = init?.runes
+  if (!R) return '<p class="muted" style="margin-top:10px">Todavía no hay datos de runas (el cliente los envía al conectar).</p>'
+  const d = draft
+  const trees = (sel, act, block) => `<div class="trees">${R.styles.map((s) => `<button class="tree ${sel === s.id ? 'sel' : ''}" data-act="${act}" data-id="${s.id}" ${block === s.id ? 'disabled style="opacity:.15"' : ''}>${treeImg(s.id)}</button>`).join('')}</div>`
+  const rowBtns = (ids, row, act, isSel) => `<div class="runerow">${ids.map((id) => `<button class="rune ${isSel(id) ? 'sel' : ''}" data-act="${act}" data-row="${row}" data-id="${id}">${perkImg(id)}</button>`).join('')}</div>`
+
+  let h = `<h3 style="margin-top:12px">Árbol principal</h3>${trees(d.primary, 'primary')}`
+  const ps = style(d.primary)
+  if (ps) ps.slots.forEach((row, ri) => { h += rowBtns(row, ri, 'main', (id) => d.main[ri] === id) })
+
+  h += `<h3 style="margin-top:12px">Árbol secundario</h3>${trees(d.sub, 'subtree', d.primary)}`
+  const ss = style(d.sub)
+  if (ss) ss.slots.forEach((row, ri) => { if (ri > 0) h += rowBtns(row, ri, 'sub', (id) => d.subs.some((x) => x.row === ri && x.id === id)) })
+
+  h += '<h3 style="margin-top:12px">Fragmentos</h3>'
+  R.shards.forEach((row, ri) => { h += rowBtns(row, ri, 'shard', (id) => d.shards[ri] === id) })
+
+  return h + `<button class="btn primary" style="margin-top:12px" data-act="applyDraft" ${draftPerks() ? '' : 'disabled'}>Aplicar runas</button>`
+}
+
+function recsHTML() {
+  const recs = curRecs()
+  if (!recs.length) return '<p class="muted" style="margin:10px 0">Sin recomendaciones para este campeón por ahora. Podés reintentar o usar la pestaña Manual.</p><button class="btn" data-cmd="refreshRecs">Buscar de nuevo</button>' + (curDiag().length ? `<details style="margin-top:10px"><summary class="muted" style="font-size:12px">Ver diagnóstico</summary><pre style="white-space:pre-wrap;word-break:break-all;font-size:10px;color:var(--mut);margin:6px 0 0">${esc(curDiag().join('\n'))}</pre></details>` : '')
+  const sw = S.phase === 'Lobby'
+  return recs.map((r, i) => `<div class="rec"><b class="gold">${esc(r.name)}</b>
+    <div class="minis">${treeImg(r.primary, 'tr')}${perkImg(r.perks[0], 'k')}${r.perks.slice(1, 6).map((id) => perkImg(id)).join('')}${treeImg(r.sub, 'tr')}</div>
+    <div class="row2">
+      <button class="btn primary" data-cmd="${sw ? 'slotRunes' : 'applyRunes'}" ${sw ? `data-slot="${swSlot}"` : 'data-name="LoL Remote"'} data-primary="${r.primary}" data-sub="${r.sub}" data-perks="${r.perks.join(',')}">Aplicar</button>
+      <button class="btn" data-act="loadrec" data-i="${i}">Editar</button>
+    </div></div>`).join('')
+}
+
+function runesHTML(c) {
+  const sw = S.phase === 'Lobby'
+  const tabs = sw ? [['rec', 'Recomendadas'], ['manual', 'Manual']] : [['rec', 'Recomendadas'], ['pages', 'Mis páginas'], ['manual', 'Manual']]
+  if (!tabs.some(([k]) => k === rtab)) rtab = 'rec'
+  const seg = `<div class="seg" style="grid-template-columns:repeat(${tabs.length},1fr)">${tabs.map(([k, l]) => `<button class="btn ${rtab === k ? 'primary' : ''}" data-act="rtab" data-rtab="${k}">${l}</button>`).join('')}</div>`
+  let body = ''
+  if (rtab === 'rec') body = recsHTML()
+  else if (rtab === 'manual') body = runeEditorHTML()
+  else {
+    const pages = c?.pages || []
+    body = pages.length
+      ? pages.map((p) => `<div class="page"><span>${esc(p.name)}</span><button class="btn" style="width:auto;padding:8px 14px" data-cmd="selectPage" data-id="${p.id}" ${p.current ? 'disabled' : ''}>${p.current ? 'Activa' : 'Usar'}</button></div>`).join('')
+      : '<p class="muted">No hay páginas editables.</p>'
+  }
+  return seg + body
+}
+
+// ───────── Swiftplay: 2 casilleros (campeón + rol + runas) ─────────
+const champSp = (id) => (id > 0 && init?.champs[id] ? `<img class="sp" src="${icon(id)}" alt="${esc(nm(id))}">` : '<div class="sp"></div>')
+
+function swiftplayHTML(l) {
+  const slots = l.slots || []
+  if (!slots.length) return `<div class="card"><h3>Swiftplay</h3><p class="muted">No pude leer tus casilleros de campeón. Mirá la consola de la PC: ahí se imprime lo que responde el cliente.</p></div>`
+  if (!slots[swSlot]) swSlot = 0
+  const cur = slots[swSlot]
+  const ROMAN = ['I', 'II', 'III']
+  const head = slots.map((s, i) => `<button class="slotbtn ${i === swSlot ? 'on' : ''}" data-act="swslot" data-slot="${i}">${champSp(s.champ)}<span><b class="gold">${ROMAN[i] || i + 1}</b> ${esc(nm(s.champ) || 'Vacío')}<br><small class="muted">${esc(s.pos ? posName(s.pos) : 'Sin rol')}</small></span></button>`).join('')
+  const tabs = [['champ', 'Campeón'], ['role', 'Rol'], ['spells', 'Hechizos'], ['runes', 'Runas'], ['skins', 'Skins']]
+  const seg = `<div class="seg">${tabs.map(([k, lb]) => `<button class="btn ${swTab === k ? 'primary' : ''}" data-act="swtab" data-swtab="${k}">${lb}</button>`).join('')}</div>`
+  let body = ''
+  if (swTab === 'champ') body = `<input id="q" type="search" placeholder="🔍 Buscar campeón..." value="${esc(filter)}" autocomplete="off"><div id="grid" class="grid" style="margin-top:10px">${gridHTML()}</div>`
+  else if (swTab === 'role') body = `<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px">${POSITIONS.map((p) => `<button class="btn ${cur.pos === p.id ? 'primary' : ''}" style="padding:12px 2px;font-size:12px" data-cmd="slotRole" data-slot="${swSlot}" data-role="${p.id}">${p.name}</button>`).join('')}</div>`
+  else if (swTab === 'spells') body = spellsHTML()
+  else if (swTab === 'skins') body = skinsHTML(cur.champ, cur.skin, `data-slot="${swSlot}"`)
+  else body = runesHTML()
+  return `<div class="card"><h3>Swiftplay — Tus campeones</h3><div class="slots" style="margin:8px 0">${head}</div>${seg}${body}</div>`
+}
+
+function lobbyPositionsHTML(l) {
+  if (!l.positions) return ''
+  const first = l.positions.firstPreference
+  const second = l.positions.secondPreference
+  const priorities = l.positions.priorities || []
+
+  let roleSelectorUI = ''
+  if (roleSelecting) {
+    const title = roleSelecting === 'first' ? 'Elegir Rol Principal' : 'Elegir Rol Secundario'
+    roleSelectorUI = `<div style="margin-top:10px;background:#050b14;padding:10px;border-radius:8px;border:1px solid var(--gold)">
+      <p class="gold" style="font-weight:600;margin-bottom:8px">${title}</p>
+      <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:4px">
+        ${POSITIONS.map(p => `
+          <button class="btn" style="padding:8px 2px;font-size:11px" data-act="setRoleChoice" data-type="${roleSelecting}" data-role="${p.id}">
+            ${p.name}
+            ${priorities.includes(p.id) ? '<br><span style="font-size:8px;color:var(--warn)">★</span>' : ''}
+          </button>
+        `).join('')}
+      </div>
+    </div>`
+  }
+
+  return `<div class="card">
+    <h3>Selección de Posiciones</h3>
+    <div class="row2" style="margin-top:8px">
+      <button class="btn ${roleSelecting === 'first' ? 'primary' : ''}" data-act="toggleRoleSelector" data-type="first">
+        Rol Principal: <br><strong class="gold">${posName(first)}</strong>
+      </button>
+      <button class="btn ${roleSelecting === 'second' ? 'primary' : ''}" data-act="toggleRoleSelector" data-type="second">
+        Rol Secundario: <br><strong class="gold">${posName(second)}</strong>
+      </button>
+    </div>
+    ${roleSelectorUI}
+  </div>`
+}
+
+const views = {
+  None: () => `<h2>Modo de Juego</h2><div class="queues">${init.queues.map((x) => `<button class="btn" data-cmd="createLobby" data-queue-id="${x.id}">${esc(x.name)}</button>`).join('')}</div>`,
+  Lobby: () => {
+    const l = S.lobby || { members: [] }
+    let content = `<div class="card"><h2>${esc(qName(l.queueId))}</h2>${l.members.map((m) => `<div class="row" style="padding:4px 0"><span>${esc(m.name)}</span>${m.leader ? '<small class="gold" style="font-weight:700">LÍDER</small>' : ''}</div>`).join('')}</div>`
+    
+    if (l.positions) {
+      content += lobbyPositionsHTML(l)
+    }
+
+    if (l.isSwiftplay) content += swiftplayHTML(l)
+
+    content += l.canStart ? '<button class="btn big primary" data-cmd="search">BUSCAR PARTIDA</button>' : '<p class="muted" style="text-align:center">Esperando al líder del lobby...</p>'
+    content += '<button class="btn danger" data-cmd="leaveLobby" style="margin-top:8px">Abandonar Lobby</button>'
+    return content
+  },
+  Matchmaking: () => `<div class="card" style="text-align:center;padding:24px"><p class="muted">Buscando oponente...</p><div id="qt" class="timer" style="margin:10px 0">0:00</div>
+      ${S.search?.estimated ? `<p class="muted">Tiempo estimado: ${fmt(S.search.estimated)}</p>` : ''}</div>
+      <button class="btn danger big" data-cmd="cancelSearch">Cancelar Búsqueda</button>`,
+  ReadyCheck: () => S.ready?.response === 'Accepted'
+    ? '<div class="card hextech-core"><div class="hextech-orb">✓</div><h2>¡Partida Aceptada!</h2><p class="muted">Esperando confirmación del resto de jugadores...</p></div>'
+    : `<div class="card hextech-core"><div class="hextech-orb"><span class="timer" style="font-size:28px">⚔</span></div><h2 class="live-pulse" style="margin-bottom:16px;text-align:center">¡PARTIDA ENCONTRADA!</h2>
+       <div class="row2" style="width:100%"><button class="btn big primary" data-cmd="accept">ACEPTAR</button><button class="btn big danger" data-cmd="decline">Rechazar</button></div></div>`,
+  ChampSelect: () => {
+    const c = S.cs
+    if (!c) return '<p class="muted" style="text-align:center">Sincronizando selección de campeón…</p>'
+    const a = c.action
+    let h = `<div class="card row"><b>${CS_PHASES[c.phase] || c.phase || ''}</b><span id="timer" class="timer">–</span></div>`
+
+    if (a) {
+      const ban = a.type === 'ban'
+      h += `<div class="card banner ${ban ? 'ban' : ''} ${a.active ? 'live' : ''}">
+        <h2 class="${a.active ? 'live-pulse' : ''}">${a.active ? (ban ? '¡TURNO DE BANEAR!' : '¡TURNO DE ELEGIR!') : (ban ? 'Pronto banearás' : 'Seleccionando o marcando pick')}</h2>
+        <p class="muted">${a.champ ? 'Selección actual: ' + esc(nm(a.champ)) : 'Tocá un campeón de la grilla inferior.'}</p></div>`
+    }
+    if (c.bans.my.length || c.bans.their.length) {
+      const b = (l) => (l.length ? l.map((id) => img(id, 'ban')).join('') : '<span class="muted">Sin baneos</span>')
+      h += `<div class="card"><h3>Baneos Aliados</h3><div class="bans">${b(c.bans.my)}</div><h3 style="margin-top:10px">Baneos Enemigos</h3><div class="bans">${b(c.bans.their)}</div></div>`
+    }
+    h += `<div class="card"><h3>Aliados</h3><div class="team">${teamHTML(c.my)}</div>`
+    if (c.their.some((p) => p.champ)) h += `<h3 style="margin-top:12px">Enemigos</h3><div class="team">${teamHTML(c.their)}</div>`
+    h += '</div>'
+
+    if (c.benchEnabled) {
+      const activeChamp = c.me?.champ || 0;
+      const benchList = c.bench || [];
+      const allMyChoices = [activeChamp, ...benchList.filter(id => id !== activeChamp)];
+
+      h += `<div class="card">
+        <div class="row">
+          <h3>Tus Campeones (ARAM)</h3>
+          ${c.canReroll ? `<span class="muted">Dados: ${c.rerolls}</span>` : ''}
+        </div>
+        <p class="muted" style="margin-bottom:8px;font-size:12px">Tocá el campeón con el que querés jugar:</p>
+        ${allMyChoices.length ? `
+          <div class="bench">
+            ${allMyChoices.map((id) => {
+              const isActive = id === activeChamp;
+              return `<button class="pick ${isActive ? 'sel' : ''}" data-cmd="swap" data-champion-id="${id}">
+                ${img(id).replace('class="ch ', 'class="')}
+                <span>${esc(nm(id))} ${isActive ? '⭐' : ''}</span>
+              </button>`;
+            }).join('')}
+          </div>` : '<p class="muted">No hay campeones disponibles.</p>'}
+        ${c.canReroll ? `<button class="btn primary" style="margin-top:10px" data-cmd="reroll" ${c.rerolls ? '' : 'disabled'}>Tirar Dado (Reroll)</button>` : ''}
+      </div>`
+    }
+    if (a?.type) {
+      h += `<div class="card"><input id="q" type="search" placeholder="🔍 Buscar campeón..." value="${esc(filter)}" autocomplete="off"><div id="grid" class="grid" style="margin-top:10px">${gridHTML()}</div></div>`
+    }
+    h += prep(c)
+    if (a?.type && a.active && a.champ) h += `<button class="btn big primary lock" data-cmd="lock">${a.type === 'ban' ? 'CONFIRMAR BANEO' : 'BLOQUEAR CAMPEÓN'}</button>`
+    return h
+  }
+}
+
+function prep(c) {
+  const spellsOk = c.gameMode !== 'CHERRY'
+  if (!spellsOk && tab === 'spells') tab = 'runes'
+  const t = (k, l) => `<button class="btn ${tab === k ? 'primary' : ''}" data-act="tab" data-tab="${k}">${l}</button>`
+  const tabsArr = [spellsOk && ['spells', 'Hechizos'], ['runes', 'Runas'], ['skins', 'Skins']].filter(Boolean)
+  const body = tab === 'spells' ? spellsHTML(c) : tab === 'runes' ? runesHTML(c) : tab === 'skins' ? skinsHTML(c.me?.champ, c.me?.skin) : ''
+  return `<div class="card"><div class="tabs" style="grid-template-columns:repeat(${tabsArr.length},1fr)">${tabsArr.map(([k, l]) => t(k, l)).join('')}</div>${body}</div>`
+}
+
+function render() {
+  const live = ws?.readyState === 1
+  $('#dot').className = live ? (S.connected ? 'ok' : 'warn') : ''
+  $('#phase').textContent = live ? PHASES[S.phase] || S.phase : 'LoL Remote'
+  const focused = document.activeElement?.id === 'q'
+  let html
+  if (!live) {
+    html = `<div class="card" style="text-align:center;padding:24px"><h2>Sin Conexión con la PC</h2><p class="muted" style="margin:10px 0">${localStorage.pin ? 'Reconectando al agente...' : 'Ingresá el PIN de 6 dígitos mostrado en la consola de la PC.'}</p></div>
+      ${localStorage.pin ? '' : '<button class="btn primary" data-act="pin">Ingresar PIN</button>'}`
+  } else if (!S.connected) {
+    html = '<div class="card" style="text-align:center;padding:24px"><h2>Cliente de LoL Cerrado</h2><p class="muted">El teléfono está vinculado, pero no se detecta el cliente abierto en la PC.</p></div>'
+  } else if (!init) {
+    html = '<p class="muted" style="text-align:center">Cargando recursos Data Dragon…</p>'
+  } else {
+    html = (views[S.phase] || (() => `<div class="card" style="text-align:center"><h2>${PHASES[S.phase] || S.phase}</h2><p class="muted">Fase sin controles remotos necesarios.</p></div>`))()
+  }
+  if (html !== lastHtml) {
+    const app = $('#app')
+    const y = window.scrollY
+    const g = app.querySelector('#grid')?.scrollTop || 0
+    const bn = app.querySelector('.bench')?.scrollLeft || 0
+    const sg = [...app.querySelectorAll('.spgrid')].map((x) => x.scrollTop)
+    app.innerHTML = html
+    lastHtml = html
+    const g2 = app.querySelector('#grid'); if (g2) g2.scrollTop = g
+    const b2 = app.querySelector('.bench'); if (b2) b2.scrollLeft = bn
+    app.querySelectorAll('.spgrid').forEach((x, i) => { x.scrollTop = sg[i] || 0 })
+    window.scrollTo(0, y)
+  }
+  if (focused) { const i = $('#q'); i?.focus(); i?.setSelectionRange(i.value.length, i.value.length) }
+  tick()
+}
+
+function tick() {
+  const el = Date.now() - recvAt
+  const t = $('#timer'); if (t && S.cs) t.textContent = Math.max(0, Math.ceil((S.cs.msLeft - el) / 1000)) + ' s'
+  const qt = $('#qt'); if (qt && S.search) qt.textContent = fmt(S.search.timeInQueue + el / 1000)
+}
+setInterval(tick, 500)
+
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-cmd]')
+  if (b && !b.disabled) { send({ t: 'cmd', ...b.dataset }); navigator.vibrate?.(15); return }
+  const a = e.target.closest('[data-act]')
+  if (a && acts[a.dataset.act]) { acts[a.dataset.act](a.dataset); render() }
+})
+document.addEventListener('input', (e) => {
+  if (e.target.id === 'q') { filter = e.target.value; $('#grid').innerHTML = gridHTML() }
+})
+
+render()
+connect()
+</script>
+</body>
+</html>
