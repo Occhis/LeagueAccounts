@@ -39,7 +39,7 @@ const POSITIONS = [
   { id: 'UTILITY', name: 'Support' }
 ]
 
-const posName = (id) => POSITIONS.find(p => p.id === id)?.name || id
+const posName = (id) => POSITIONS.find(p => p.id === id)?.name || (id === 'FILL' ? 'Autorrelleno' : id === 'UNSELECTED' ? 'Sin elegir' : id)
 
 const q = new URLSearchParams(location.search)
 if (q.get('pin')) { localStorage.pin = q.get('pin'); history.replaceState(null, '', location.pathname) }

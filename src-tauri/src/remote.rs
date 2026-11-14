@@ -487,19 +487,36 @@ pub async fn refresh_state(state: &Arc<RemoteState>) {
                 let queue_id = l.pointer("/gameConfig/queueId").and_then(|q| q.as_i64()).unwrap_or(0);
                 let mut positions = Value::Null;
                 if [400, 420, 440].contains(&queue_id) {
+                    // Si el usuario acaba de cambiar de rol, mostramos eso unos segundos
+                    // (el cliente de LoL tarda un poco en reflejar el cambio).
                     let cached = state.last_role_change.read().await.clone();
                     if let Some((inst, val)) = cached {
-                        if inst.elapsed() < Duration::from_secs(2) {
+                        if inst.elapsed() < Duration::from_secs(3) {
                             positions = val;
                         }
                     }
                     if positions.is_null() {
-                        let (_, pos_data) = state
-                            .lcu(reqwest::Method::GET, "/lol-lobby/v2/lobby/members/localMember/position-preferences", None)
-                            .await;
+                        // Los roles reales vienen dentro del propio lobby (localMember).
+                        // Antes se pedia otro endpoint que no devuelve datos y se inventaba TOP/MID.
+                        let real = |key: &str| -> Option<String> {
+                            l.pointer(&format!("/localMember/{}", key))
+                                .and_then(|x| x.as_str())
+                                .filter(|v| !v.is_empty())
+                                .map(|v| v.to_uppercase())
+                        };
+                        // Si el cliente no informa nada, conservamos lo ultimo que se mostro
+                        // en vez de inventar valores.
+                        let prev = state.last_state.read().await.pointer("/lobby/positions").cloned();
+                        let prev_str = |key: &str| -> Option<String> {
+                            prev.as_ref().and_then(|p| p.get(key)).and_then(|x| x.as_str()).map(|v| v.to_string())
+                        };
                         positions = json!({
-                            "firstPreference": pos_data.get("firstPreference").and_then(|x| x.as_str()).unwrap_or("TOP"),
-                            "secondPreference": pos_data.get("secondPreference").and_then(|x| x.as_str()).unwrap_or("MIDDLE"),
+                            "firstPreference": real("firstPositionPreference")
+                                .or_else(|| prev_str("firstPreference"))
+                                .unwrap_or_else(|| "UNSELECTED".to_string()),
+                            "secondPreference": real("secondPositionPreference")
+                                .or_else(|| prev_str("secondPreference"))
+                                .unwrap_or_else(|| "UNSELECTED".to_string()),
                             "priorities": ["BOTTOM", "UTILITY"]
                         });
                     }
@@ -613,6 +630,49 @@ pub async fn refresh_state(state: &Arc<RemoteState>) {
                     .map(|p| json!({ "id": p["id"], "name": p["name"], "current": p["current"].as_bool().unwrap_or(false) }))
                     .collect();
 
+                // Mapa y modo reales (antes estaban fijos en 11 / CLASSIC)
+                let (_, gfs) = state.lcu(reqwest::Method::GET, "/lol-gameflow/v1/session", None).await;
+                let map_id = gfs.pointer("/map/id").and_then(|x| x.as_i64()).filter(|m| *m > 0).unwrap_or(11);
+                let game_mode = gfs
+                    .pointer("/gameData/queue/gameMode")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("CLASSIC")
+                    .to_string();
+
+                // Runas recomendadas por el cliente para mi campeon/rol/mapa
+                let my_champ = me_obj.as_ref().and_then(|m| m["champ"].as_i64()).unwrap_or(0);
+                let my_pos = me_obj
+                    .as_ref()
+                    .and_then(|m| m["pos"].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let mut recs = json!([]);
+                let mut rec_diag = json!([]);
+                if my_champ > 0 {
+                    let key = format!("{}|{}|{}", my_champ, my_pos, map_id);
+                    let need_fetch = {
+                        let mut cache = state.rec_cache.write().await;
+                        if cache.contains_key(&key) {
+                            false
+                        } else {
+                            cache.insert(key.clone(), json!({ "recs": [], "diag": ["Buscando recomendaciones..."] }));
+                            true
+                        }
+                    };
+                    if need_fetch {
+                        let st2 = state.clone();
+                        let key2 = key.clone();
+                        let pos2 = my_pos.clone();
+                        tokio::spawn(async move {
+                            fetch_recs(st2, key2, my_champ, pos2, map_id).await;
+                        });
+                    }
+                    if let Some(c) = state.rec_cache.read().await.get(&key) {
+                        recs = c["recs"].clone();
+                        rec_diag = c["diag"].clone();
+                    }
+                }
+
                 st["cs"] = json!({
                     "phase": s.pointer("/timer/phase"),
                     "msLeft": s.pointer("/timer/adjustedTimeLeftInPhase").and_then(|x| x.as_i64()).unwrap_or(0),
@@ -629,10 +689,11 @@ pub async fn refresh_state(state: &Arc<RemoteState>) {
                     "action": my_action,
                     "pool": pool,
                     "me": me_obj,
-                    "mapId": 11,
-                    "gameMode": "CLASSIC",
+                    "mapId": map_id,
+                    "gameMode": game_mode,
                     "pages": pages,
-                    "recs": []
+                    "recs": recs,
+                    "recDiag": rec_diag
                 });
             }
         }
@@ -643,6 +704,123 @@ pub async fn refresh_state(state: &Arc<RemoteState>) {
         obj.insert("t".into(), json!("state"));
     }
     let _ = state.tx.send(st.to_string());
+}
+
+const DEFAULT_REC_TPL: &str =
+    "/lol-perks/v1/recommended-pages/champion/{championId}/position/{position}/map/{mapId}";
+
+fn fill_template(tpl: &str, champ: i64, pos: &str, map_id: i64) -> String {
+    let mut out = String::new();
+    let mut rest = tpl;
+    loop {
+        let Some(start) = rest.find('{') else {
+            out.push_str(rest);
+            return out;
+        };
+        let Some(len) = rest[start..].find('}') else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..start]);
+        let name = rest[start + 1..start + len].to_lowercase();
+        if name.contains("champion") {
+            out.push_str(&champ.to_string());
+        } else if name.contains("position") {
+            out.push_str(pos);
+        } else if name.contains("map") {
+            out.push_str(&map_id.to_string());
+        } else {
+            out.push_str(&rest[start..start + len + 1]);
+        }
+        rest = &rest[start + len + 1..];
+    }
+}
+
+// Busca en la documentacion del propio cliente la ruta de las recomendaciones
+// (puede cambiar entre parches). Se guarda en rec_cache bajo la clave "__tpl".
+async fn recs_template(state: &Arc<RemoteState>) -> String {
+    if let Some(v) = state.rec_cache.read().await.get("__tpl") {
+        if let Some(t) = v.as_str() {
+            return t.to_string();
+        }
+    }
+    let mut tpl = DEFAULT_REC_TPL.to_string();
+    let (_, mut doc) = state.lcu(reqwest::Method::GET, "/swagger/v3/openapi.json", None).await;
+    if !doc.get("paths").map(|p| p.is_object()).unwrap_or(false) {
+        let (_, d2) = state.lcu(reqwest::Method::GET, "/swagger/v2/swagger.json", None).await;
+        doc = d2;
+    }
+    if let Some(paths) = doc.get("paths").and_then(|p| p.as_object()) {
+        let best = paths.keys().find(|p| {
+            let l = p.to_lowercase();
+            l.starts_with("/lol-perks/") && l.contains("recommend") && l.contains("champion") && l.contains("position") && l.contains("map")
+        });
+        if let Some(b) = best {
+            tpl = b.clone();
+        }
+    }
+    state.rec_cache.write().await.insert("__tpl".to_string(), json!(tpl));
+    tpl
+}
+
+fn first_i64(p: &Value, ptrs: &[&str]) -> Option<i64> {
+    ptrs.iter().find_map(|k| p.pointer(k).and_then(|x| x.as_i64())).filter(|v| *v != 0)
+}
+
+// Convierte una pagina recomendada del cliente al formato que usa el celular
+fn norm_rec(p: &Value) -> Option<Value> {
+    let arr = ["/selectedPerkIds", "/perkIds", "/perks/perkIds", "/perks"]
+        .iter()
+        .find_map(|k| p.pointer(k).and_then(|x| x.as_array()))?;
+    let ids: Vec<i64> = arr.iter().filter_map(|x| x.as_i64()).collect();
+    let primary = first_i64(p, &["/primaryStyleId", "/primaryPerkStyleId", "/perks/perkStyle", "/perkStyle"])?;
+    let sub = first_i64(p, &["/subStyleId", "/secondaryPerkStyleId", "/perks/perkSubStyle", "/perkSubStyle"])?;
+    if ids.len() < 9 {
+        return None;
+    }
+    let name = p.get("name").and_then(|x| x.as_str()).filter(|n| !n.is_empty()).unwrap_or("Recomendada");
+    Some(json!({ "name": name, "primary": primary, "sub": sub, "perks": &ids[..9] }))
+}
+
+async fn fetch_recs(state: Arc<RemoteState>, key: String, champ: i64, pos: String, map_id: i64) {
+    let tpl = recs_template(&state).await;
+    let mut diag: Vec<String> = vec![format!("ruta: {}", tpl)];
+    let mut out: Vec<Value> = Vec::new();
+
+    let mut candidates: Vec<String> = if pos.is_empty() {
+        vec!["none".to_string(), "NONE".to_string()]
+    } else {
+        vec![pos.clone(), pos.to_uppercase()]
+    };
+    candidates.dedup();
+
+    for p in candidates {
+        let url = fill_template(&tpl, champ, &p, map_id);
+        let (code, r) = state.lcu(reqwest::Method::GET, &url, None).await;
+        let arr: Vec<Value> = if let Some(a) = r.as_array() {
+            a.clone()
+        } else {
+            r.get("recommendedPages")
+                .or_else(|| r.get("pages"))
+                .and_then(|x| x.as_array())
+                .cloned()
+                .unwrap_or_default()
+        };
+        out = arr.iter().filter_map(norm_rec).collect();
+        if out.is_empty() {
+            let body: String = r.to_string().chars().take(200).collect();
+            diag.push(format!("{} -> {} (0 validas) {}", url, code, body));
+        } else {
+            diag.push(format!("{} -> {} ({} paginas)", url, code, out.len()));
+            break;
+        }
+    }
+
+    state
+        .rec_cache
+        .write()
+        .await
+        .insert(key, json!({ "recs": out, "diag": diag }));
 }
 
 async fn edit_slot(state: &Arc<RemoteState>, slot_idx: usize, patch: impl FnOnce(&mut Value)) -> (u16, Value) {
@@ -679,6 +857,10 @@ async fn execute_command(state: &Arc<RemoteState>, m: &Value) -> Option<Value> {
                 "firstPreference": first,
                 "secondPreference": second
             }))).await
+        }
+        "refreshRecs" => {
+            state.rec_cache.write().await.clear();
+            (200, Value::Null)
         }
         "slotChampion" => {
             let c_id = to_i64("championId");
