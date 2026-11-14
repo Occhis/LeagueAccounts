@@ -767,14 +767,32 @@ fn first_i64(p: &Value, ptrs: &[&str]) -> Option<i64> {
     ptrs.iter().find_map(|k| p.pointer(k).and_then(|x| x.as_i64())).filter(|v| *v != 0)
 }
 
-// Convierte una pagina recomendada del cliente al formato que usa el celular
-fn norm_rec(p: &Value) -> Option<Value> {
-    let arr = ["/selectedPerkIds", "/perkIds", "/perks/perkIds", "/perks"]
+// Un id puede venir como numero suelto o como objeto { "id": 8008, ... }
+fn perk_id(v: &Value) -> Option<i64> {
+    v.as_i64()
+        .or_else(|| v.get("id").and_then(|x| x.as_i64()))
+        .or_else(|| v.get("perkId").and_then(|x| x.as_i64()))
+}
+
+// Convierte una pagina recomendada del cliente al formato que usa el celular.
+// `shards` = valor por defecto de cada fila de fragmentos (por si la recomendacion no los trae).
+fn norm_rec(p: &Value, shards: &[i64]) -> Option<Value> {
+    let arr = ["/selectedPerkIds", "/perkIds", "/perks/perkIds", "/perks", "/runes"]
         .iter()
         .find_map(|k| p.pointer(k).and_then(|x| x.as_array()))?;
-    let ids: Vec<i64> = arr.iter().filter_map(|x| x.as_i64()).collect();
+    let mut ids: Vec<i64> = arr.iter().filter_map(perk_id).collect();
+    // Si la lista no incluye la runa clave, la agregamos al principio
+    if let Some(k) = p.get("keystone").and_then(perk_id) {
+        if !ids.contains(&k) {
+            ids.insert(0, k);
+        }
+    }
     let primary = first_i64(p, &["/primaryStyleId", "/primaryPerkStyleId", "/perks/perkStyle", "/perkStyle"])?;
     let sub = first_i64(p, &["/subStyleId", "/secondaryPerkStyleId", "/perks/perkSubStyle", "/perkSubStyle"])?;
+    // Las recomendaciones a veces traen solo las 6 runas y no los 3 fragmentos
+    if ids.len() == 6 && shards.len() == 3 {
+        ids.extend_from_slice(shards);
+    }
     if ids.len() < 9 {
         return None;
     }
@@ -782,9 +800,42 @@ fn norm_rec(p: &Value) -> Option<Value> {
     Some(json!({ "name": name, "primary": primary, "sub": sub, "perks": &ids[..9] }))
 }
 
+// Resumen corto de la forma de una respuesta, para el diagnostico
+fn shape(v: &Value) -> String {
+    match v {
+        Value::Object(o) => {
+            let mut parts: Vec<String> = Vec::new();
+            for (k, val) in o {
+                let d = match val {
+                    Value::Array(a) => format!("{}[{}]", k, a.len()),
+                    Value::Object(_) => format!("{}{{}}", k),
+                    Value::String(sv) => format!("{}=\"{}\"", k, sv.chars().take(24).collect::<String>()),
+                    other => format!("{}={}", k, other),
+                };
+                parts.push(d);
+            }
+            parts.join(", ")
+        }
+        other => other.to_string().chars().take(80).collect(),
+    }
+}
+
 async fn fetch_recs(state: Arc<RemoteState>, key: String, champ: i64, pos: String, map_id: i64) {
     let tpl = recs_template(&state).await;
     let mut diag: Vec<String> = vec![format!("ruta: {}", tpl)];
+    let shards: Vec<i64> = {
+        let init = state.init_data.read().await;
+        let from_rows: Vec<i64> = init
+            .pointer("/runes/shards")
+            .and_then(|x| x.as_array())
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row.as_array().and_then(|r| r.first()).and_then(|x| x.as_i64()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if from_rows.len() == 3 { from_rows } else { vec![5008, 5008, 5011] }
+    };
     let mut out: Vec<Value> = Vec::new();
 
     let mut candidates: Vec<String> = if pos.is_empty() {
@@ -806,10 +857,18 @@ async fn fetch_recs(state: Arc<RemoteState>, key: String, champ: i64, pos: Strin
                 .cloned()
                 .unwrap_or_default()
         };
-        out = arr.iter().filter_map(norm_rec).collect();
+        out = arr.iter().filter_map(|x| norm_rec(x, &shards)).collect();
         if out.is_empty() {
-            let body: String = r.to_string().chars().take(200).collect();
-            diag.push(format!("{} -> {} (0 validas) {}", url, code, body));
+            diag.push(format!("{} -> {} (0 validas de {})", url, code, arr.len()));
+            if let Some(first) = arr.first() {
+                diag.push(format!("campos: {}", shape(first)));
+                if let Some(pk) = first.get("perks").and_then(|x| x.as_array()).and_then(|a| a.first()) {
+                    diag.push(format!("perks[0]: {}", shape(pk)));
+                }
+            } else {
+                let body: String = r.to_string().chars().take(200).collect();
+                diag.push(format!("respuesta: {}", body));
+            }
         } else {
             diag.push(format!("{} -> {} ({} paginas)", url, code, out.len()));
             break;
